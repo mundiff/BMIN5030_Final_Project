@@ -1,0 +1,144 @@
+---
+title: "Environmental Trichloroethylene (TCE) Exposure, Social Vulnerability, and Cognitive Difficulty in Pennsylvania"
+subtitle: "BMIN5030 Final Project"
+author: "Michael Condiff"
+format: html
+editor: visual
+number-sections: true
+embed-resources: true
+execute: 
+  warning: false
+  message: false
+---
+
+------------------------------------------------------------------------
+
+## Overview {#sec-overview}
+
+This project asks whether environmental exposure to trichloroethylene (TCE), an industrial solvent and common groundwater contaminant, is associated with cognitive difficulty across Pennsylvania census tracts after accounting for social vulnerability. I will build a tract-level TCE exposure measure from public environmental monitoring data (EPA Water Quality Portal, Superfund sites, and AirToxScreen) and link it to American Community Survey (ACS) estimates of cognitive difficulty and the CDC Social Vulnerability Index (SVI), then model these relationships with regression and machine learning. I discussed this project with Colleen Morse, who helped me understand limitations of mapping Penn Medicine Biobank data without reidentification, and Joe Romano, who helped me focus on TCE and provided background on SuperFund sites.
+
+It's possible that I will run a Phewas on PMBB participants by providing TCE exposure levels at specific locations with Colleen Morse. I am still working on this but it's possible that we'll get some hits for kidney or other cancers with higher levels of TCE exposure.
+
+GitHub repository: <https://github.com/YOUR-USERNAME/BMIN5030_Final_Project>
+
+## Introduction {#sec-introduction}
+
+Trichloroethylene (TCE) is a chlorinated solvent that was used widely for metal degreasing, dry cleaning, and manufacturing, and it remains one of the most frequently detected contaminants at hazardous waste sites and in groundwater across the United States . TCE is classified as carcinogenic to humans, with the strongest evidence for kidney cancer, and a growing body of research links it to neurological harm, including Parkinson's disease (Camp Lejeune as an example). Much of what is known comes from occupational cohorts or single contamination events, so less is known about how lower-level, community-wide environmental exposure relates to neurological and cognitive health in the general population. Pennsylvania, with its long industrial history and many contaminated sites, is a useful setting to study this question. Exposure is also unlikely to be evenly distributed: communities near industrial sites often face other disadvantages, such as poverty, limited health care access, and housing burden, that independently affect health. Separating the effect of TCE from social vulnerability is therefore central to understanding whether TCE contributes to cognitive difficulty at the population level.
+
+This problem is interdisciplinary because no single field can answer it alone. Environmental science and hydrogeology are needed to understand where TCE is found, how it moves through groundwater and air, and how monitoring data are collected (for example, sampling tends to cluster near suspected contamination, which can bias simple averages). Epidemiology and neurology provide the framework for which health outcomes are plausible and how confounding should be handled. Geography and spatial statistics are needed to combine data measured at different scales (point samples, facility locations, and census tracts) and to account for spatial autocorrelation. Social science and public health contribute measures of social vulnerability and an environmental justice lens on who bears the exposure burden. From my meeting with \[Faculty/Staff Name 1\], I learned \[2-3 sentences on how their perspective shaped your approach, e.g., which data sources to trust, how to handle non-detects, or which outcomes to focus on\]. From my meeting with \[Faculty/Staff Name 2\], I learned \[2-3 sentences, e.g., how to think about confounding by social vulnerability, or about future linkage to individual-level biobank data\].
+
+## Methods {#sec-methods}
+
+The unit of analysis is the 2020 census tract in Pennsylvania. The outcome is the percentage of the population with a cognitive difficulty from the ACS 5-year estimates (2018-2022), which are reported on 2020 tract boundaries. The exposure is built from TCE measurements in the EPA Water Quality Portal (2000-2020), with Superfund and AirToxScreen data to be added. Social vulnerability is measured with the CDC SVI. This draft covers the first steps: getting tract boundaries, the outcome, and the raw TCE monitoring data.
+
+```{r}
+#| label: load-packages
+
+library(tidyverse)
+library(sf)
+library(tigris)
+library(tidycensus)
+library(dataRetrieval)   # Water Quality Portal access
+library(ggspatial)
+options(tigris_use_cache = TRUE)
+```
+
+### Census tract boundaries
+
+```{r}
+#| label: pa-tracts
+
+pa.tracts <- tracts(state = "PA", year = 2020, cb = TRUE)
+
+ggplot() +
+  geom_sf(data = pa.tracts, lwd = 0.05) +
+  theme_void() +
+  ggtitle("Pennsylvania census tracts, 2020")
+```
+
+### Outcome: cognitive difficulty (ACS 2018-2022)
+
+ACS table B18104 breaks down the population by sex, age, and whether they have a cognitive difficulty. To get the percentage with a cognitive difficulty in each tract, I find every variable in that table whose label includes "With a cognitive difficulty," add them up, and divide by the table total (B18104_001).
+
+```{r}
+#| label: acs-cognitive
+
+acs.vars <- load_variables(2022, "acs5")
+
+cog.vars <- acs.vars |>
+  filter(str_detect(name, "^B18104_"),
+         str_detect(label, "With a cognitive difficulty"))
+cog.vars
+
+cog <- get_acs(geography = "tract",
+               state = "PA",
+               variables = cog.vars$name,
+               summary_var = "B18104_001",
+               year = 2022,
+               survey = "acs5") |>
+  group_by(GEOID) |>
+  summarize(cog.n = sum(estimate),
+            total.pop = first(summary_est)) |>
+  mutate(pct.cog = 100 * cog.n / total.pop)
+
+summary(cog$pct.cog)
+```
+
+```{r}
+#| label: map-cognitive
+
+pa.tracts.cog <- pa.tracts |>
+  left_join(cog, by = "GEOID")
+
+ggplot() +
+  geom_sf(data = pa.tracts.cog, aes(fill = pct.cog), lwd = 0) +
+  scale_fill_viridis_c(name = "Cognitive \ndifficulty (%)", na.value = "grey80") +
+  theme_void() +
+  ggtitle("Percent of population with a cognitive difficulty, PA tracts, 2018-2022") +
+  annotation_scale(location = "bl")
+```
+
+### Exposure: TCE measurements from the Water Quality Portal
+
+I query all TCE results for Pennsylvania from 2000-2020. Most of these are ambient groundwater and surface water samples rather than finished drinking water, so they are treated as a measure of environmental contamination. Monitoring locations come with the results as site information, which I convert to an `sf` object to map.
+
+```{r}
+#| label: wqp-tce
+
+tce.raw <- readWQPdata(statecode = "US:42",
+                       characteristicName = "Trichloroethylene",
+                       startDateLo = "2000-01-01",
+                       startDateHi = "2020-12-31")
+
+nrow(tce.raw)
+
+# How are results reported? (units and detection flags guide the cleaning step)
+tce.raw |> count(ResultMeasure.MeasureUnitCode, sort = TRUE)
+tce.raw |> count(ResultDetectionConditionText, sort = TRUE)
+
+tce.sites <- attr(tce.raw, "siteInfo") |>
+  filter(!is.na(dec_lat_va), !is.na(dec_lon_va)) |>
+  st_as_sf(coords = c("dec_lon_va", "dec_lat_va"), crs = 4269) |>
+  st_transform(st_crs(pa.tracts))
+
+ggplot() +
+  geom_sf(data = pa.tracts, lwd = 0.05, fill = "white") +
+  geom_sf(data = tce.sites, color = "red", size = 0.6, alpha = 0.5) +
+  theme_void() +
+  ggtitle("Water Quality Portal monitoring sites with TCE results, 2000-2020")
+```
+
+### Next steps
+
+- Clean the TCE results: standardize units to µg/L, handle non-detects (detection limit / 2, with a sensitivity check), and summarize to the tract level while tracking the number of samples per tract.
+- Add Superfund sites with TCE as a contaminant of concern and AirToxScreen modeled air concentrations.
+- Join the CDC SVI (2020) by tract `GEOID`.
+- Fit regression models of cognitive difficulty on TCE exposure adjusting for age structure and SVI, check spatial autocorrelation, and compare with machine learning models (random forest) to test whether TCE adds predictive value beyond SVI.
+
+## Results {#sec-results}
+
+\[To be completed.\]
+
+## Conclusion
+
+\[To be completed.\]
