@@ -1,0 +1,1051 @@
+---
+title: "Environmental Trichloroethylene (TCE) Exposure, Social Vulnerability, and Cognitive Difficulty in Pennsylvania"
+subtitle: "BMIN5030 Final Project"
+author: "Michael Condiff"
+format: html
+editor: visual
+number-sections: true
+embed-resources: true
+execute: 
+  warning: false
+  message: false
+---
+
+------------------------------------------------------------------------
+
+## Overview {#sec-overview}
+
+This project asks whether environmental exposure to trichloroethylene (TCE), an industrial solvent and common groundwater contaminant, is associated with cognitive difficulty across Pennsylvania census tracts after accounting for social vulnerability. I will build a tract-level TCE exposure measure from public environmental monitoring data (EPA Water Quality Portal, Superfund sites, and AirToxScreen) and link it to American Community Survey (ACS) estimates of cognitive difficulty and the CDC Social Vulnerability Index (SVI), then model these relationships with regression and machine learning. I discussed this project with Colleen Morse, who helped me understand limitations of mapping Penn Medicine Biobank data without reidentification, and Joe Romano, who helped me focus on TCE and provided background on SuperFund sites.
+
+It's possible that I will run a Phewas on PMBB participants by providing TCE exposure levels at specific locations with Colleen Morse. I am still working on this but it's possible that we'll get some hits for kidney or other cancers with higher levels of TCE exposure.
+
+GitHub repository: <https://github.com/mundiff/BMIN5030_Final_Project>
+
+## Introduction {#sec-introduction}
+
+Trichloroethylene (TCE) is a chlorinated solvent that was used widely for metal degreasing, dry cleaning, and manufacturing, and it remains one of the most frequently detected contaminants at hazardous waste sites and in groundwater across the United States . TCE is classified as carcinogenic to humans, with the strongest evidence for kidney cancer, and a growing body of research links it to neurological harm, including Parkinson's disease (Camp Lejeune as an example). Much of what is known comes from occupational cohorts or single contamination events, so less is known about how lower-level, community-wide environmental exposure relates to neurological and cognitive health in the general population. Pennsylvania, with its long industrial history and many contaminated sites, is a useful setting to study this question. Exposure is also unlikely to be evenly distributed: communities near industrial sites often face other disadvantages, such as poverty, limited health care access, and housing burden, that independently affect health. Separating the effect of TCE from social vulnerability is therefore central to understanding whether TCE contributes to cognitive difficulty at the population level.
+
+This problem is interdisciplinary because no single field can answer it alone. Environmental science and hydrogeology are needed to understand where TCE is found, how it moves through groundwater and air, and how monitoring data are collected (for example, sampling tends to cluster near suspected contamination, which can bias simple averages). Epidemiology and neurology provide the framework for which health outcomes are plausible and how confounding should be handled. Geography and spatial statistics are needed to combine data measured at different scales (point samples, facility locations, and census tracts) and to account for spatial autocorrelation. Social science and public health contribute measures of social vulnerability and an environmental justice lens on who bears the exposure burden. From my meeting with \[Faculty/Staff Name 1\], I learned \[2-3 sentences on how their perspective shaped your approach, e.g., which data sources to trust, how to handle non-detects, or which outcomes to focus on\]. From my meeting with \[Faculty/Staff Name 2\], I learned \[2-3 sentences, e.g., how to think about confounding by social vulnerability, or about future linkage to individual-level biobank data\].
+
+## Methods {#sec-methods}
+
+The unit of analysis is the 2020 census tract in Pennsylvania. The outcome is the percentage of adults aged 18-64 with a cognitive difficulty from the ACS 5-year estimates (2018-2022), which are reported on 2020 tract boundaries. Exposure to TCE is measured three ways: water monitoring results from the EPA Water Quality Portal (2000-2020), distance to Superfund sites with TCE as a contaminant of concern, and modeled air concentrations from EPA's 2020 AirToxScreen. Social vulnerability is measured with SVI component variables from the ACS, and urbanicity with population density.
+
+```{r}
+#| label: load-packages
+
+library(tidyverse)
+library(sf)
+library(tigris)
+library(tidycensus)
+library(dataRetrieval)   # Water Quality Portal access
+library(ggspatial)
+library(readxl)
+library(janitor)
+options(tigris_use_cache = TRUE)
+```
+
+All downloaded data are saved under `data/raw/` and `data/processed/` the first time they are retrieved, and later renders read the saved copies instead of downloading again. Two small helpers handle this: `cached()` saves the result of a query, and `download_once()` saves a downloaded file. To refresh any source, delete its saved file and render again.
+
+```{r}
+#| label: helpers-settings
+
+# Run `expr` once and save the result; afterwards read the saved copy
+cached <- function(file, expr) {
+  if (file.exists(file)) return(readRDS(file))
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+  out <- expr
+  saveRDS(out, file)
+  out
+}
+
+# Download a file once; a partial download is never left under the final name
+download_once <- function(url, file) {
+  if (!file.exists(file)) {
+    dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+    options(timeout = max(1200, getOption("timeout")))
+    tmp <- paste0(file, ".part")
+    download.file(url, tmp, mode = "wb")
+    file.rename(tmp, file)
+  }
+  file
+}
+
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+
+crs.analysis <- 5070      # CONUS Albers equal-area projection, meters
+buffer.m     <- 2000      # "nearby" distance (m)
+border.m     <- 10000     # include out-of-state Superfund sites within 10 km of PA
+sems.states  <- c("PA", "NJ", "NY", "OH", "WV", "MD", "DE")
+tce.pattern  <- regex("trichloroeth(yl)?ene", ignore_case = TRUE)   # excludes trichloroethane
+```
+
+### Census tract boundaries
+
+```{r}
+#| label: pa-tracts
+
+# Cartographic boundaries (water areas such as Lake Erie removed) for maps
+pa.tracts <- tracts(state = "PA", year = 2020, cb = TRUE)
+
+# Full TIGER/Line boundaries, projected, for buffers and distances
+pa.tracts.tiger <- tracts(state = "PA", year = 2020, cb = FALSE) |>
+  st_transform(crs.analysis)
+
+pa.boundary <- states(year = 2020, cb = TRUE) |>
+  filter(STUSPS == "PA") |>
+  st_transform(crs.analysis)
+
+ggplot() +
+  geom_sf(data = pa.tracts, lwd = 0.05) +
+  theme_void() +
+  ggtitle("Pennsylvania census tracts, 2020")
+```
+
+### Outcome: cognitive difficulty among adults 18-64 (ACS 2018-2022)
+
+The ACS asks, for each household member age 5 and older, whether "because of a physical, mental, or emotional condition" the person has "serious difficulty concentrating, remembering, or making decisions." Table B18104 reports the answers by sex and age group. Cognitive difficulty is strongly tied to age: among older adults it largely reflects dementia, and among children it largely reflects developmental conditions. To reduce confounding by a tract's age structure, the main outcome is the percentage of adults aged 18-64 with a cognitive difficulty: the four "with a cognitive difficulty" counts for ages 18-34 and 35-64 (male and female), divided by the total population in those same four groups. The all-ages percentage is kept for a sensitivity analysis.
+
+```{r}
+#| label: acs-cognitive
+
+acs.vars <- load_variables(2022, "acs5", cache = TRUE)
+
+b18104 <- acs.vars |> filter(str_detect(name, "^B18104_"))
+
+# Numerator: "With a cognitive difficulty" for ages 18-34 and 35-64, both sexes
+cog.num.vars <- b18104 |>
+  filter(str_detect(label, "(18 to 34|35 to 64) years:!!With a cognitive difficulty"))
+
+# Denominator: the total for each of those four sex-by-age groups
+cog.den.vars <- b18104 |>
+  filter(str_detect(label, "(18 to 34|35 to 64) years:$"))
+
+# All-ages version (sensitivity analysis)
+cog.all.vars <- b18104 |>
+  filter(str_detect(label, "With a cognitive difficulty"))
+
+cog.num.vars |> select(name, label)
+cog.den.vars |> select(name, label)
+stopifnot(nrow(cog.num.vars) == 4, nrow(cog.den.vars) == 4)
+
+cog.raw <- cached("data/raw/acs_b18104_pa_2022.rds",
+  get_acs(geography = "tract",
+          state = "PA",
+          variables = unique(c(cog.num.vars$name, cog.den.vars$name,
+                               cog.all.vars$name, "B18104_001")),
+          year = 2022,
+          survey = "acs5"))
+
+cog <- cog.raw |>
+  group_by(GEOID) |>
+  summarize(cog.n      = sum(estimate[variable %in% cog.num.vars$name]),
+            pop.1864   = sum(estimate[variable %in% cog.den.vars$name]),
+            cog.n.all  = sum(estimate[variable %in% cog.all.vars$name]),
+            pop.all    = sum(estimate[variable == "B18104_001"]),
+            .groups    = "drop") |>
+  mutate(pct.cog     = if_else(pop.1864 > 0, 100 * cog.n / pop.1864, NA_real_),
+         pct.cog.all = if_else(pop.all > 0, 100 * cog.n.all / pop.all, NA_real_))
+
+summary(cog$pct.cog)
+summary(cog$pct.cog.all)
+```
+
+```{r}
+#| label: map-cognitive
+
+pa.tracts.cog <- pa.tracts |>
+  left_join(cog, by = "GEOID")
+
+ggplot() +
+  geom_sf(data = pa.tracts.cog, aes(fill = pct.cog), lwd = 0) +
+  scale_fill_viridis_c(name = "Cognitive \ndifficulty (%),\nages 18-64", na.value = "grey80") +
+  theme_void() +
+  ggtitle("Percent of adults 18-64 with a cognitive difficulty, PA tracts, 2018-2022") +
+  annotation_scale(location = "bl")
+```
+
+### Exposure: TCE in water (Water Quality Portal)
+
+I query all TCE results for Pennsylvania from 2000-2020. Most of these are ambient groundwater and surface water samples rather than finished drinking water, so they are treated as a measure of environmental contamination. Monitoring locations come with the results as site information, which I convert to an `sf` object to map.
+
+```{r}
+#| label: wqp-tce
+
+# Saved with its site information (stored as an attribute) after the first query
+tce.raw <- cached("data/raw/wqp_tce_pa_2000_2020.rds",
+  readWQPdata(statecode = "US:42",
+              characteristicName = "Trichloroethylene",
+              startDateLo = "2000-01-01",
+              startDateHi = "2020-12-31"))
+
+nrow(tce.raw)
+
+# How are results reported? (units and detection flags guide the cleaning step)
+tce.raw |> count(ResultMeasure.MeasureUnitCode, sort = TRUE)
+tce.raw |> count(ResultDetectionConditionText, sort = TRUE)
+
+# Site information is attached to the results; its coordinate column names
+# depend on the dataRetrieval version, so find whichever pair is present
+site.info <- attr(tce.raw, "siteInfo")
+if (is.null(site.info)) stop("No site information attached to the WQP results.")
+
+lat.col <- intersect(c("dec_lat_va", "LatitudeMeasure", "Location_Latitude"), names(site.info))[1]
+lon.col <- intersect(c("dec_lon_va", "LongitudeMeasure", "Location_Longitude"), names(site.info))[1]
+if (is.na(lat.col) || is.na(lon.col))
+  stop("No latitude/longitude columns found. Site info columns are: ",
+       paste(names(site.info), collapse = ", "))
+
+tce.sites <- site.info |>
+  mutate(lat = suppressWarnings(as.numeric(.data[[lat.col]])),
+         lon = suppressWarnings(as.numeric(.data[[lon.col]]))) |>
+  filter(!is.na(lat), !is.na(lon)) |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4269) |>
+  st_transform(st_crs(pa.tracts))
+
+nrow(tce.sites)
+
+ggplot() +
+  geom_sf(data = pa.tracts, lwd = 0.05, fill = "white") +
+  geom_sf(data = tce.sites, color = "red", size = 0.6, alpha = 0.5) +
+  theme_void() +
+  ggtitle("Water Quality Portal monitoring sites with TCE results, 2000-2020")
+```
+
+### Cleaning the TCE results
+
+The raw Water Quality Portal results need four cleaning steps before they can be used as an exposure measure:
+
+1.  **Keep only real water samples.** I drop results from other media (sediment, soil, tissue) and quality control samples such as field blanks and spikes, which do not describe the environment.
+2.  **Standardize units to µg/L.** Results are reported in several units, so I convert them all to micrograms per liter. Rows with units that cannot be converted to a water concentration (for example, µg/kg) are dropped.
+3.  **Handle non-detects.** Many samples report that TCE was not detected above a detection limit, rather than a measured value. Treating these as zero would understate exposure, and dropping them would overstate it, so the main analysis substitutes half the detection limit. I also keep two alternative versions (zero and the full detection limit) for a sensitivity check. Results flagged as present but below the quantification limit are treated as detections at the reported limit.
+4.  **Summarize by monitoring site.** Each site gets its number of samples, whether TCE was ever detected, and its maximum concentration.
+
+```{r}
+#| label: tce-clean
+
+# Convert a concentration to µg/L; returns NA for units that are not water concentrations
+to.ugl <- function(x, unit) {
+  x <- suppressWarnings(as.numeric(x))
+  unit <- str_to_lower(str_trim(unit))
+  case_when(
+    unit %in% c("ug/l", "ppb")  ~ x,
+    unit %in% c("mg/l", "ppm")  ~ x * 1000,
+    unit %in% c("ng/l", "ppt")  ~ x / 1000,
+    TRUE                        ~ NA_real_
+  )
+}
+
+tce.water <- tce.raw |>
+  filter(ActivityMediaName == "Water",
+         !str_detect(coalesce(ActivityTypeCode, ""), "Quality Control"))
+
+tce.clean <- tce.water |>
+  mutate(
+    result.ugl = to.ugl(ResultMeasureValue, ResultMeasure.MeasureUnitCode),
+    dl.ugl     = to.ugl(DetectionQuantitationLimitMeasure.MeasureValue,
+                        DetectionQuantitationLimitMeasure.MeasureUnitCode),
+    condition  = str_to_lower(coalesce(ResultDetectionConditionText, "")),
+    # "Not Detected" and "Below ... Limit" are non-detects;
+    # "Present Below Quantification Limit" and "Detected Not Quantified" are detections
+    nondetect  = str_detect(condition, "not detected|below") &
+                 !str_detect(condition, "present"),
+    detected   = !nondetect,
+    value.ugl  = case_when(
+      nondetect                ~ dl.ugl / 2,
+      !is.na(result.ugl)       ~ result.ugl,
+      TRUE                     ~ dl.ugl        # detected but not quantified
+    ),
+    value.ugl.nd0 = if_else(nondetect, 0, value.ugl),      # sensitivity: non-detects = 0
+    value.ugl.ndl = if_else(nondetect, dl.ugl, value.ugl)  # sensitivity: non-detects = DL
+  ) |>
+  filter(!is.na(value.ugl)) |>
+  # the same sample can be reported more than once (e.g., total and dissolved fractions)
+  distinct(MonitoringLocationIdentifier, ActivityStartDate, value.ugl, .keep_all = TRUE)
+```
+
+Before summarizing, I check how many rows each step removed, how common non-detects are, and how high the detection limits are. Detection limits matter because a non-detect with a very high limit (well above the EPA drinking water standard of 5 µg/L) carries little information and would inflate the maximum after substitution.
+
+```{r}
+#| label: tce-clean-checks
+
+tibble(step = c("Raw results", "Water, non-QC", "Usable value after cleaning"),
+       rows = c(nrow(tce.raw), nrow(tce.water), nrow(tce.clean)))
+
+tce.clean |> count(detected)
+
+tce.clean |>
+  filter(nondetect) |>
+  summarize(median.dl = median(dl.ugl),
+            pct.dl.above.mcl = 100 * mean(dl.ugl > 5))
+
+summary(tce.clean$value.ugl)
+```
+
+```{r}
+#| label: tce-site-summary
+
+tce.site.summary <- tce.clean |>
+  group_by(MonitoringLocationIdentifier) |>
+  summarize(n.samples  = n(),
+            any.detect = any(detected),
+            max.ugl    = max(value.ugl),
+            first.year = min(year(ActivityStartDate)),
+            last.year  = max(year(ActivityStartDate)))
+
+# Projected CRS (CONUS Albers, meters) so buffers and distances are in real units
+tce.sites.5070 <- tce.sites |>
+  inner_join(tce.site.summary, by = "MonitoringLocationIdentifier") |>
+  st_transform(crs.analysis)
+
+tce.sites.5070 |> st_drop_geometry() |> count(any.detect)
+```
+
+### Tract-level water exposure
+
+Monitoring sites are points, but the analysis needs one value per tract. For each tract I find all monitoring sites within 2 km of the tract boundary and record the number of sites and samples, whether TCE was detected at any of them, and the maximum concentration. Because sampling clusters near suspected contamination, a tract with no nearby monitoring is coded as missing rather than zero: "no TCE found" and "nobody looked" are different situations. To give every tract a value, I also compute the distance from each tract to the nearest site where TCE was detected.
+
+Buffers and distances use the full TIGER/Line tract boundaries (`pa.tracts.tiger`) because the cartographic boundaries used for maps are simplified, which would distort them.
+
+```{r}
+#| label: tract-tce
+
+near <- st_is_within_distance(pa.tracts.tiger, tce.sites.5070, dist = 2000)
+
+tract.tce <- tibble(
+  GEOID          = pa.tracts.tiger$GEOID,
+  n.sites        = lengths(near),
+  n.samples      = map_int(near, \(i) sum(tce.sites.5070$n.samples[i])),
+  tce.detect.any = map_int(near, \(i) if (length(i) == 0) NA_integer_
+                                      else as.integer(any(tce.sites.5070$any.detect[i]))),
+  tce.max.ugl    = map_dbl(near, \(i) if (length(i) == 0) NA_real_
+                                      else max(tce.sites.5070$max.ugl[i]))
+)
+
+# Distance from each tract to the nearest site with a detection (0 if the site is inside the tract)
+detect.sites <- tce.sites.5070 |> filter(any.detect)
+nearest <- st_nearest_feature(pa.tracts.tiger, detect.sites)
+tract.tce$dist.detect.km <- as.numeric(
+  st_distance(pa.tracts.tiger, detect.sites[nearest, ], by_element = TRUE)) / 1000
+
+tract.tce |>
+  mutate(status = case_when(n.sites == 0        ~ "Not monitored",
+                            tce.detect.any == 1 ~ "TCE detected",
+                            TRUE                ~ "Monitored, not detected")) |>
+  count(status)
+
+summary(tract.tce$dist.detect.km)
+```
+
+```{r}
+#| label: map-tract-tce
+
+pa.tracts.tce <- pa.tracts |>
+  left_join(tract.tce, by = "GEOID") |>
+  mutate(status = case_when(n.sites == 0        ~ "Not monitored",
+                            tce.detect.any == 1 ~ "TCE detected",
+                            TRUE                ~ "Monitored, not detected"),
+         status = factor(status, levels = c("TCE detected", "Monitored, not detected",
+                                            "Not monitored")))
+
+ggplot() +
+  geom_sf(data = pa.tracts.tce, aes(fill = status), lwd = 0) +
+  scale_fill_manual(name = NULL,
+                    values = c("TCE detected" = "#d7301f",
+                               "Monitored, not detected" = "#fdbb84",
+                               "Not monitored" = "grey85")) +
+  theme_void() +
+  ggtitle("TCE monitoring status within 2 km of each tract, 2000-2020") +
+  annotation_scale(location = "bl")
+```
+
+### Exposure: Superfund sites with TCE
+
+The second exposure measure is proximity to Superfund sites where TCE is a contaminant of concern. Site and contaminant records come from EPA's Superfund Enterprise Management System (SEMS) through the Envirofacts API. The API's built-in join between the site and contaminant tables fails, so the two tables are pulled separately and joined here on the site ID. Sites in the six neighboring states are included so that tracts near the state border are not treated as far from every site. Each site is located by its recorded coordinate, not its full footprint, and is flagged if TCE was recorded in groundwater, the pathway most relevant to vapor intrusion.
+
+```{r}
+#| label: superfund-sites
+
+ef.base     <- "https://data.epa.gov/efservice/"
+ef.max.rows <- 100000L   # integer, so it pastes into URLs as "100000" rather than "1e+05"
+
+ef_get <- function(url) {
+  df <- read_csv(url, col_types = cols(.default = "c"), show_col_types = FALSE)
+  if (ncol(df) == 1 && str_detect(names(df)[1], "error"))
+    stop("Envirofacts API error for ", url, ": ", names(df)[1])
+  if (nrow(df) >= ef.max.rows) warning("Results may be truncated: ", url)
+  clean_names(df)
+}
+
+# TCE contaminant records for all SEMS sites nationwide
+sems.contam.tce <- cached("data/raw/sems_contaminants_tce.rds",
+  ef_get(paste0(ef.base, "sems.envirofacts_contaminants/preferred_contaminant_name/",
+                "contains/trichloroeth/1:", ef.max.rows, "/CSV"))) |>
+  filter(str_detect(preferred_contaminant_name, tce.pattern))   # drops trichloroethane
+
+sems.contam.tce |> count(preferred_contaminant_name)
+sems.contam.tce |> count(media_name, sort = TRUE) |> head(8)
+
+# Sites in Pennsylvania and neighboring states
+sems.sites <- cached("data/raw/sems_sites_pa_region.rds",
+  map(sems.states, \(st) ef_get(paste0(ef.base, "sems.envirofacts_site/fk_ref_state_code/",
+                                       "equals/", st, "/1:", ef.max.rows, "/CSV"))) |>
+    list_rbind())
+
+npl.site.info <- sems.contam.tce |>
+  group_by(site_id = fk_site_id) |>
+  summarize(media       = paste(sort(unique(media_name)), collapse = "; "),
+            groundwater = any(str_detect(media_name, regex("ground", ignore_case = TRUE)),
+                              na.rm = TRUE),
+            .groups     = "drop")
+
+npl.sites <- sems.sites |>
+  distinct(site_id, .keep_all = TRUE) |>
+  inner_join(npl.site.info, by = "site_id") |>
+  mutate(lat = as.numeric(primary_latitude_decimal_val),
+         lon = as.numeric(primary_longitude_decimal_val)) |>
+  filter(!is.na(lat), !is.na(lon)) |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) |>
+  st_transform(crs.analysis)
+
+# Keep sites in PA or within 10 km of the state boundary
+npl.sites <- npl.sites[lengths(st_is_within_distance(npl.sites, pa.boundary, border.m)) > 0, ]
+
+npl.sites |> st_drop_geometry() |> count(in.pa = fk_ref_state_code == "PA")
+npl.sites |> st_drop_geometry() |> count(npl_status_name, sort = TRUE)
+```
+
+Almost all of these sites are on, or were deleted from, the National Priorities List (NPL), because contaminant records come from cleanup decision documents. Sites deleted from the NPL after cleanup are kept, since past exposure is relevant to a long-latency outcome.
+
+Distance is measured from each tract's 2020 population-weighted center (the Census Bureau's "center of population") to the nearest site. Measuring from the tract boundary instead would score a large rural tract as 0 km whenever a site falls anywhere inside it, even if most residents live far away. The boundary-based distance is kept for a sensitivity analysis. Tracts with no population use a point inside the tract.
+
+```{r}
+#| label: superfund-distance
+
+cenpop.file <- download_once(
+  "https://www2.census.gov/geo/docs/reference/cenpop2020/tract/CenPop2020_Mean_TR.txt",
+  "data/raw/CenPop2020_Mean_TR.txt")
+
+tract.centers <- read_csv(cenpop.file, col_types = cols(.default = "c")) |>
+  clean_names() |>
+  filter(statefp == "42") |>
+  transmute(GEOID      = paste0(statefp, countyfp, tractce),
+            center.pop = as.numeric(population),
+            lat        = as.numeric(latitude),
+            lon        = as.numeric(longitude))
+
+# One point per tract, in the same order as pa.tracts.tiger
+pts.info <- pa.tracts.tiger |>
+  st_drop_geometry() |>
+  select(GEOID) |>
+  left_join(tract.centers, by = "GEOID") |>
+  mutate(use.center = !is.na(lat) & !is.na(lon) & coalesce(center.pop, 0) > 0)
+
+center.geom <- pts.info |>
+  mutate(lat = if_else(use.center, lat, 0), lon = if_else(use.center, lon, 0)) |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) |>
+  st_transform(crs.analysis) |>
+  st_geometry()
+inside.geom <- st_point_on_surface(st_geometry(pa.tracts.tiger))
+center.geom[!pts.info$use.center] <- inside.geom[!pts.info$use.center]
+
+pa.tract.points <- st_sf(GEOID = pts.info$GEOID, use.center = pts.info$use.center,
+                         geometry = center.geom)
+count(st_drop_geometry(pa.tract.points), use.center)
+
+dist_to_nearest_km <- function(from, to) {
+  as.numeric(st_distance(from, to[st_nearest_feature(from, to), ], by_element = TRUE)) / 1000
+}
+
+gw.sites <- npl.sites |> filter(groundwater)
+
+tract.superfund <- tibble(
+  GEOID                = pa.tracts.tiger$GEOID,
+  npl.tce.dist.km      = dist_to_nearest_km(pa.tract.points, npl.sites),
+  npl.tce.n.2km        = lengths(st_is_within_distance(pa.tract.points, npl.sites, buffer.m)),
+  npl.tce.gw.dist.km   = dist_to_nearest_km(pa.tract.points, gw.sites),
+  npl.tce.dist.edge.km = dist_to_nearest_km(pa.tracts.tiger, npl.sites)
+)
+
+summary(select(tract.superfund, -GEOID))
+
+# Population-center vs. boundary distance
+tract.superfund |>
+  summarize(n.edge.zero   = sum(npl.tce.dist.edge.km == 0),
+            n.center.lt2  = sum(npl.tce.dist.km < 2),
+            median.change = median(npl.tce.dist.km - npl.tce.dist.edge.km),
+            spearman      = cor(npl.tce.dist.km, npl.tce.dist.edge.km, method = "spearman"))
+```
+
+```{r}
+#| label: map-superfund
+
+pa.tracts.npl <- pa.tracts |>
+  left_join(tract.superfund, by = "GEOID") |>
+  mutate(dist.band = cut(npl.tce.dist.km, breaks = c(-Inf, 1, 2, 5, 10, Inf),
+                         labels = c("< 1 km", "1-2 km", "2-5 km", "5-10 km", "> 10 km")))
+
+ggplot() +
+  geom_sf(data = pa.tracts.npl, aes(fill = dist.band), lwd = 0) +
+  geom_sf(data = npl.sites, color = "black", size = 0.8) +
+  scale_fill_viridis_d(name = "Distance from tract\npopulation center", direction = -1) +
+  coord_sf(xlim = st_bbox(pa.boundary)[c(1, 3)], ylim = st_bbox(pa.boundary)[c(2, 4)],
+           crs = crs.analysis) +
+  theme_void() +
+  ggtitle("Distance to the nearest Superfund site with TCE")
+```
+
+### Exposure: modeled air concentrations (AirToxScreen 2020)
+
+The third exposure measure is EPA's 2020 AirToxScreen, which models outdoor air toxics concentrations from emissions inventories. I use the exposure concentration, which adjusts outdoor levels for time spent in different settings, summed across all emission sources. The 2020 results are reported for census blocks, which nest inside 2020 tracts, so each tract's value is the average of its blocks weighted by block population from the 2020 Census.
+
+```{r}
+#| label: airtox-read
+
+airtox.zip <- download_once(
+  "https://gaftp.epa.gov/rtrmodeling_public/AirToxScreen/2020/Pollutant%20Summaries/Region3/TRICHLOROETHYLENE_EXPCONC_R3.zip",
+  "data/raw/TRICHLOROETHYLENE_EXPCONC_R3.zip")
+
+airtox.csv <- "data/raw/airtox/TRICHLOROETHYLENE_EXPCONC_R3.csv"
+if (!file.exists(airtox.csv)) unzip(airtox.zip, exdir = "data/raw/airtox")
+
+# Region 3 file (PA, DE, MD, VA, WV, DC): keep Pennsylvania blocks
+airtox <- read_csv(airtox.csv, show_col_types = FALSE, guess_max = 100000) |>
+  clean_names() |>
+  mutate(block.id = sprintf("%.0f", block)) |>   # 15-digit block FIPS stored as a number
+  filter(str_starts(block.id, "42"))
+
+airtox |> count(pollutant_name)
+summary(airtox$total_exposure_conc)
+
+# 2020 Census block populations (one request per county the first time, then cached)
+block.pop <- cached("data/processed/pa_block_pop_2020.rds", {
+  pa.counties <- fips_codes |> filter(state == "PA") |> pull(county_code)
+  map(pa.counties, \(cty) get_decennial(geography = "block", variables = "P1_001N",
+                                         year = 2020, sumfile = "pl",
+                                         state = "PA", county = cty)) |>
+    list_rbind() |>
+    select(id = GEOID, pop = value)
+})
+
+airtox.blocks <- airtox |>
+  select(block.id, total = total_exposure_conc, point = pt_stationary_point_exposure_conc) |>
+  left_join(block.pop, by = c("block.id" = "id")) |>
+  mutate(GEOID = str_sub(block.id, 1, 11), pop = replace_na(pop, 0))
+
+mean(!is.na(match(airtox.blocks$block.id, block.pop$id)))   # share of blocks matched
+
+tract.airtox <- airtox.blocks |>
+  group_by(GEOID) |>
+  summarize(n.blocks   = n(),
+            airtox.pop = sum(pop),
+            airtox.tce = if (sum(pop) > 0) weighted.mean(total, pop) else mean(total),
+            pct.point  = 100 * sum(point * pop) / sum(total * pop),
+            .groups    = "drop")
+
+sum(!pa.tracts.tiger$GEOID %in% tract.airtox$GEOID)   # tracts with no value (unpopulated)
+summary(tract.airtox$airtox.tce)
+```
+
+```{r}
+#| label: map-airtox
+
+ggplot() +
+  geom_sf(data = left_join(pa.tracts, tract.airtox, by = "GEOID"),
+          aes(fill = airtox.tce), lwd = 0) +
+  scale_fill_viridis_c(name = "TCE (µg/m³)", trans = "log10", na.value = "grey85") +
+  theme_void() +
+  ggtitle("AirToxScreen 2020 modeled TCE exposure concentration, PA tracts")
+```
+
+Modeled concentrations are very right-skewed: the highest tract is several hundred times the statewide median. To see what drives the hotspots, I list the highest tracts with the share of their concentration coming from stationary point sources (industrial facilities), and the Pennsylvania facilities with the largest reported TCE emissions in AirToxScreen's 2020 facility inventory.
+
+```{r}
+#| label: airtox-hotspots
+
+tract.airtox |>
+  arrange(desc(airtox.tce)) |>
+  select(GEOID, airtox.tce, pct.point, airtox.pop) |>
+  head(10)
+
+fac.file <- download_once(
+  "https://www.epa.gov/system/files/other-files/2024-05/point_fac_2020_mapapp.xlsx",
+  "data/raw/point_fac_2020_mapapp.xlsx")
+
+# One row per facility, one column per pollutant (tons in 2020). The first seven
+# columns identify the facility; a label row sits below the file's title row.
+fac <- read_excel(fac.file) |> clean_names()
+tce.col <- names(fac)[str_detect(names(fac), "^trichloroethylene")][1]
+
+airtox.facilities <- fac |>
+  select(1:7, all_of(tce.col)) |>
+  setNames(c("eis.facility.id", "facility", "county.fips", "county", "state",
+             "lat", "lon", "tce.tons")) |>
+  mutate(tce.tons = suppressWarnings(as.numeric(tce.tons))) |>   # drops the label row
+  filter(state == "Pennsylvania", tce.tons > 0) |>
+  arrange(desc(tce.tons))
+
+airtox.facilities |> select(facility, county, tce.tons) |> head(10)
+
+write_csv(airtox.facilities, "data/processed/airtox_tce_facilities.csv")
+```
+
+### Combined exposure file
+
+The three exposure sources are saved together for later use, including the binned exposure file for the Penn Medicine BioBank linkage.
+
+```{r}
+#| label: exposure-combined
+
+tract.exposure <- tract.superfund |>
+  left_join(select(tract.airtox, GEOID, airtox.tce, airtox.pct.point = pct.point), by = "GEOID") |>
+  left_join(tract.tce, by = "GEOID")
+
+# Superfund proximity and air concentration capture different sources
+cor(tract.exposure$npl.tce.dist.km, tract.exposure$airtox.tce,
+    method = "spearman", use = "complete.obs")
+
+write_csv(tract.exposure, "data/processed/tract_tce_exposure.csv")
+```
+
+### Social vulnerability and proximity to urban environments (ACS 2018-2022)
+
+Social vulnerability is measured with component variables that follow the CDC SVI definitions, taken directly from the same ACS 2018-2022 data as the outcome so the survey years match. I use the components rather than the SVI composite scores because the SVI Household Characteristics theme includes the percentage of residents with a disability and the percentage aged 65 and older, which overlap with the outcome. The components are the percentage below 150% of the federal poverty line, unemployment rate, percentage of adults 25 and older without a high school diploma, percentage without health insurance, median household income, and percentage of residents who are a racial or ethnic minority (everyone other than non-Hispanic white). Urbanicity is measured as population density (people per square kilometer of land).
+
+```{r}
+#| label: acs-covariates
+
+ses.vars <- c(pov.tot   = "C17002_001", pov.lt50  = "C17002_002", pov.50_99  = "C17002_003",
+              pov.100_124 = "C17002_004", pov.125_149 = "C17002_005",
+              lf.civ    = "B23025_003", unemp     = "B23025_005",
+              ed.tot    = "B15003_001",
+              setNames(sprintf("B15003_%03d", 2:16), paste0("ed.lths", 2:16)),
+              hh.income = "B19013_001",
+              race.tot  = "B03002_001", nh.white = "B03002_003",
+              pop.total = "B01003_001")
+
+ses.raw <- cached("data/raw/acs_ses_pa_2022.rds",
+  get_acs(geography = "tract", state = "PA", variables = ses.vars,
+          year = 2022, survey = "acs5", output = "wide"))
+
+# Percent uninsured comes from a subject table, so it is pulled separately
+uninsured <- cached("data/raw/acs_uninsured_pa_2022.rds",
+  get_acs(geography = "tract", state = "PA",
+          variables = c(pct.uninsured = "S2701_C05_001"),
+          year = 2022, survey = "acs5")) |>
+  select(GEOID, pct.uninsured = estimate)
+
+ses <- ses.raw |>
+  transmute(GEOID,
+            pct.pov150   = 100 * (pov.lt50E + pov.50_99E + pov.100_124E + pov.125_149E) / pov.totE,
+            pct.unemp    = 100 * unempE / lf.civE,
+            pct.nohs     = 100 * rowSums(pick(matches("^ed\\.lths\\d+E$"))) / ed.totE,
+            hh.income    = hh.incomeE,
+            pct.minority = 100 * (1 - nh.whiteE / race.totE),
+            pop.total    = pop.totalE) |>
+  mutate(across(where(is.double), \(x) if_else(is.finite(x), x, NA_real_))) |>
+  left_join(uninsured, by = "GEOID")
+
+# Population density from land area of the 2020 tracts
+density <- pa.tracts |>
+  st_drop_geometry() |>
+  transmute(GEOID, land.km2 = ALAND / 1e6)
+
+ses <- ses |>
+  left_join(density, by = "GEOID") |>
+  mutate(pop.density = if_else(land.km2 > 0, pop.total / land.km2, NA_real_))
+
+summary(select(ses, -GEOID))
+```
+
+### Analytic dataset
+
+All sources are joined into one table with one row per tract. Exposure variables are prepared as follows:
+
+- **Water monitoring status** has three levels. The reference level is "Monitored, not detected," so that tracts where TCE was detected are compared with tracts that were also sampled.
+- **Distances** to the nearest water detection and the nearest TCE Superfund site are log-transformed, and the Superfund distance is also grouped into bands (under 5 km, 5-10 km, over 10 km).
+- **AirToxScreen concentration** is very right-skewed, so it is log-transformed, and tracts in the top 5% are flagged as high-exposure tracts.
+
+Tracts are excluded if they have fewer than 200 residents aged 18-64 (their ACS estimates are too unstable) or are missing the outcome or a covariate.
+
+```{r}
+#| label: analytic-dataset
+
+analytic.all <- tibble(GEOID = pa.tracts$GEOID) |>
+  left_join(cog, by = "GEOID") |>
+  left_join(ses, by = "GEOID") |>
+  left_join(tract.exposure |>
+              rename(water.n.sites    = n.sites,
+                     water.n.samples  = n.samples,
+                     water.detect.any = tce.detect.any,
+                     water.max.ugl    = tce.max.ugl,
+                     water.dist.km    = dist.detect.km),
+            by = "GEOID") |>
+  mutate(
+    water.status = case_when(water.n.sites == 0      ~ "Not monitored",
+                             water.detect.any == 1   ~ "TCE detected",
+                             TRUE                    ~ "Monitored, not detected"),
+    water.status = factor(water.status,
+                          levels = c("Monitored, not detected", "TCE detected", "Not monitored")),
+    log.water.dist = log10(water.dist.km + 0.1),
+    log.npl.dist   = log10(npl.tce.dist.km),
+    npl.dist.band  = cut(npl.tce.dist.km, breaks = c(0, 5, 10, Inf),
+                         labels = c("< 5 km", "5-10 km", "> 10 km"), include.lowest = TRUE),
+    npl.dist.band  = fct_relevel(npl.dist.band, "> 10 km"),
+    log.airtox     = log10(airtox.tce),
+    airtox.high    = as.integer(airtox.tce >= quantile(airtox.tce, 0.95, na.rm = TRUE)),
+    log.density    = log10(pop.density + 1),
+    income.10k     = hh.income / 10000
+  )
+
+# Exclusions, reported step by step
+model.vars <- c("pct.cog", "water.status", "log.npl.dist", "log.airtox",
+                "pct.pov150", "pct.unemp", "pct.nohs", "pct.uninsured",
+                "income.10k", "pct.minority", "log.density")
+
+analytic <- analytic.all |>
+  filter(pop.1864 >= 200) |>
+  drop_na(all_of(model.vars))
+
+tibble(step = c("All 2020 PA tracts",
+                "200+ residents aged 18-64",
+                "Complete outcome, exposure, and covariate data"),
+       tracts = c(nrow(analytic.all),
+                  sum(analytic.all$pop.1864 >= 200, na.rm = TRUE),
+                  nrow(analytic)))
+
+# Which variables cause the most missingness among eligible tracts?
+analytic.all |>
+  filter(pop.1864 >= 200) |>
+  summarize(across(all_of(model.vars), \(x) sum(is.na(x)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "n.missing") |>
+  filter(n.missing > 0)
+
+analytic |> count(water.status)
+analytic |> count(npl.dist.band)
+
+write_csv(analytic, "data/processed/analytic_tracts.csv")
+```
+
+## Results {#sec-results}
+
+```{r}
+#| label: results-packages
+
+library(gtsummary)   # Table 1
+library(sandwich)    # robust standard errors
+library(lmtest)
+library(broom)
+```
+
+### Table 1: tract characteristics by TCE exposure
+
+Table 1 compares tracts across water monitoring status, and Table 2 across distance to the nearest TCE Superfund site. Values are medians with interquartile ranges, and p-values are from Kruskal-Wallis tests. These comparisons show whether more-exposed tracts differ systematically in social vulnerability and urbanicity, which would make those characteristics potential confounders.
+
+```{r}
+#| label: table1
+
+table1.labels <- list(
+  pct.cog         ~ "Cognitive difficulty, ages 18-64 (%)",
+  pct.cog.all     ~ "Cognitive difficulty, all ages (%)",
+  airtox.tce      ~ "AirToxScreen TCE (µg/m³)",
+  npl.tce.dist.km ~ "Distance to TCE Superfund site (km)",
+  pct.pov150      ~ "Below 150% of poverty line (%)",
+  pct.unemp       ~ "Unemployed (%)",
+  pct.nohs        ~ "No high school diploma, age 25+ (%)",
+  pct.uninsured   ~ "Uninsured (%)",
+  hh.income       ~ "Median household income ($)",
+  pct.minority    ~ "Racial or ethnic minority (%)",
+  pop.density     ~ "Population density (per km²)",
+  pop.1864        ~ "Residents aged 18-64"
+)
+
+table1.vars <- map_chr(table1.labels, \(f) as.character(f[[2]]))
+
+make_table1 <- function(data, by, caption) {
+  data |>
+    select(all_of(c(by, table1.vars))) |>
+    tbl_summary(by = all_of(by),
+                label = table1.labels,
+                statistic = all_continuous() ~ "{median} ({p25}, {p75})",
+                digits = list(all_continuous() ~ 1, airtox.tce ~ 4)) |>
+    add_overall() |>
+    add_p(test = all_continuous() ~ "kruskal.test") |>
+    modify_caption(caption)
+}
+
+make_table1(analytic, "water.status",
+            "**Table 1.** Tract characteristics by water monitoring status (TCE within 2 km)")
+
+make_table1(analytic, "npl.dist.band",
+            "**Table 2.** Tract characteristics by distance to the nearest TCE Superfund site")
+```
+
+### Regression models
+
+Each exposure is modeled separately in three nested linear regressions of the percentage of adults 18-64 with a cognitive difficulty:
+
+1.  **Crude:** the exposure alone.
+2.  **+ Social vulnerability:** adding poverty, unemployment, no high school diploma, uninsured, median household income (per \$10,000), and percent minority.
+3.  **+ Urbanicity:** adding log population density.
+
+Models are weighted by the number of residents aged 18-64, because estimates from larger tracts are more precise, and use heteroskedasticity-robust (HC1) standard errors. Comparing the exposure coefficient across the three models shows how much of any crude association is explained by social vulnerability and urbanicity. A final model includes all three exposures together.
+
+How to read the coefficients:
+
+- **Water monitoring status:** the difference in percentage points compared with tracts that were monitored but had no detection.
+- **Superfund distance (log10 km):** the change in percentage points for each 10-fold increase in distance. A negative value means tracts closer to sites have more cognitive difficulty.
+- **AirToxScreen concentration (log10 µg/m³):** the change in percentage points for each 10-fold increase in modeled TCE.
+
+```{r}
+#| label: regression-nested
+
+ses.terms <- "pct.pov150 + pct.unemp + pct.nohs + pct.uninsured + income.10k + pct.minority"
+
+exposures <- c("Water monitoring status"  = "water.status",
+               "Superfund distance"       = "log.npl.dist",
+               "AirToxScreen air TCE"     = "log.airtox")
+
+model.formulas <- function(expo) {
+  c("1. Crude"                    = paste("pct.cog ~", expo),
+    "2. + Social vulnerability"   = paste("pct.cog ~", expo, "+", ses.terms),
+    "3. + Urbanicity"             = paste("pct.cog ~", expo, "+", ses.terms, "+ log.density"))
+}
+
+fit_robust <- function(formula) {
+  m <- lm(as.formula(formula), data = analytic, weights = pop.1864)
+  coeftest(m, vcov = vcovHC(m, type = "HC1")) |>
+    tidy(conf.int = TRUE) |>
+    mutate(adj.r2 = summary(m)$adj.r.squared)
+}
+
+nested.results <- imap(exposures, \(expo, expo.name) {
+  imap(model.formulas(expo), \(f, model.name) {
+    fit_robust(f) |> mutate(model = model.name)
+  }) |>
+    list_rbind() |>
+    mutate(exposure = expo.name)
+}) |>
+  list_rbind() |>
+  filter(str_detect(term, "^water.status|^log.npl.dist|^log.airtox"))
+
+nested.results |>
+  transmute(exposure, model,
+            term = str_remove(term, "^water.status"),
+            estimate = round(estimate, 3),
+            ci = sprintf("(%.3f, %.3f)", conf.low, conf.high),
+            p.value = signif(p.value, 2),
+            adj.r2 = round(adj.r2, 3)) |>
+  knitr::kable(col.names = c("Exposure", "Model", "Term", "Estimate", "95% CI",
+                             "p-value", "Adj. R²"))
+```
+
+```{r}
+#| label: regression-plot
+#| fig-height: 5
+
+nested.results |>
+  mutate(term = case_when(term == "water.statusTCE detected"  ~ "Water: TCE detected",
+                          term == "water.statusNot monitored" ~ "Water: not monitored",
+                          term == "log.npl.dist"              ~ "Superfund: log10 distance",
+                          term == "log.airtox"                ~ "Air: log10 TCE"),
+         model = fct_rev(factor(model))) |>
+  ggplot(aes(x = estimate, y = model, xmin = conf.low, xmax = conf.high, color = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_pointrange() +
+  facet_wrap(~ term, scales = "free_x", ncol = 2) +
+  scale_color_viridis_d(end = 0.8, guide = "none") +
+  labs(x = "Difference in cognitive difficulty, ages 18-64 (percentage points), with 95% CI",
+       y = NULL,
+       title = "TCE exposure coefficients across nested models") +
+  theme_minimal()
+```
+
+```{r}
+#| label: regression-full
+
+full.formula <- paste("pct.cog ~ water.status + log.npl.dist + log.airtox +",
+                      ses.terms, "+ log.density")
+m.full <- lm(as.formula(full.formula), data = analytic, weights = pop.1864)
+
+coeftest(m.full, vcov = vcovHC(m.full, type = "HC1")) |>
+  tidy(conf.int = TRUE) |>
+  mutate(across(where(is.numeric), \(x) signif(x, 3))) |>
+  knitr::kable()
+
+summary(m.full)$adj.r.squared
+```
+
+### Sensitivity analyses: region and insurance
+
+Two concerns from the main models are tested here, using the fully adjusted model with all three exposures:
+
+- **Regional confounding.** TCE Superfund sites cluster in suburban southeast Pennsylvania, while much of rural central and western Pennsylvania is far from any site. If cognitive difficulty differs between regions for reasons the covariates do not capture, the Superfund association could reflect region rather than proximity. Adding county fixed effects compares tracts only with other tracts in the same county.
+- **Insurance as a consequence of the outcome.** Percent uninsured had an unexpected negative coefficient. Disability can make people eligible for Medicaid or Medicare, so insurance coverage may partly result from the outcome rather than confound it. The model is refit without it.
+
+```{r}
+#| label: sensitivity-region
+
+analytic <- analytic |> mutate(county = str_sub(GEOID, 1, 5))
+
+exposure.terms  <- "water.status + log.npl.dist + log.airtox"
+ses.terms.noins <- "pct.pov150 + pct.unemp + pct.nohs + income.10k + pct.minority"
+
+main.formula <- paste("pct.cog ~", exposure.terms, "+", ses.terms, "+ log.density")
+
+sens.formulas <- c(
+  "Main model"             = main.formula,
+  "+ County fixed effects" = paste(main.formula, "+ factor(county)"),
+  "Without % uninsured"    = paste("pct.cog ~", exposure.terms, "+", ses.terms.noins,
+                                   "+ log.density")
+)
+
+keep_exposures <- function(x) {
+  filter(x, str_detect(term, "^water.status|^log.npl.dist|^log.airtox"))
+}
+
+sens.ols <- imap(sens.formulas, \(f, nm) fit_robust(f) |> mutate(model = nm)) |>
+  list_rbind() |>
+  keep_exposures()
+```
+
+### Spatial dependence
+
+Neighboring tracts tend to resemble each other, which violates the regression assumption that observations are independent and makes standard errors too small. Neighbors are defined as tracts sharing a border or corner (queen contiguity), with each tract's neighbors weighted equally. Moran's I tests whether the outcome and the main model's residuals are spatially clustered. If the residuals are clustered, a spatial error model accounts for it by allowing the unexplained part of each tract's outcome to be correlated with its neighbors'.
+
+```{r}
+#| label: spatial-weights
+
+library(spdep)
+library(spatialreg)
+
+# Analytic tracts with geometry; models below use this row order
+analytic.sf <- pa.tracts |>
+  select(GEOID) |>
+  inner_join(analytic, by = "GEOID") |>
+  st_transform(crs.analysis)
+analytic.sp <- st_drop_geometry(analytic.sf)
+stopifnot(nrow(analytic.sp) == nrow(analytic))
+
+nb <- poly2nb(analytic.sf, queen = TRUE)
+sum(card(nb) == 0)   # tracts with no neighbors
+summary(card(nb))    # neighbors per tract
+
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Is the outcome itself spatially clustered?
+moran.test(analytic.sp$pct.cog, lw, zero.policy = TRUE)
+
+# Are the main model's residuals spatially clustered?
+m.main <- lm(as.formula(main.formula), data = analytic.sp, weights = pop.1864)
+moran.test(residuals(m.main), lw, zero.policy = TRUE)
+```
+
+```{r}
+#| label: map-residuals
+
+analytic.sf |>
+  mutate(resid = residuals(m.main)) |>
+  ggplot() +
+  geom_sf(aes(fill = resid), lwd = 0) +
+  scale_fill_gradient2(name = "Residual\n(percentage\npoints)",
+                       low = "#2166ac", mid = "white", high = "#b2182b",
+                       limits = c(-10, 10), oob = scales::squish) +
+  theme_void() +
+  ggtitle("Main model residuals: red = more cognitive difficulty than predicted")
+```
+
+```{r}
+#| label: spatial-error-model
+
+# method = "Matrix" uses sparse matrix methods, which are much faster than the
+# default eigenvalue method for ~3,400 tracts
+sem <- errorsarlm(as.formula(main.formula), data = analytic.sp, listw = lw,
+                  weights = pop.1864, zero.policy = TRUE, method = "Matrix")
+
+sem.coef <- summary(sem)$Coef
+sem.results <- tibble(term      = rownames(sem.coef),
+                      estimate  = sem.coef[, 1],
+                      std.error = sem.coef[, 2],
+                      p.value   = sem.coef[, 4]) |>
+  mutate(conf.low  = estimate - 1.96 * std.error,
+         conf.high = estimate + 1.96 * std.error,
+         model     = "Spatial error model")
+
+sem.results |>
+  mutate(across(where(is.numeric), \(x) signif(x, 3))) |>
+  knitr::kable()
+
+tibble(lambda   = sem$lambda,                 # spatial correlation of the errors
+       AIC.ols  = AIC(m.main),
+       AIC.sem  = AIC(sem)) |>
+  knitr::kable(digits = 3)
+
+# Residual clustering should be much weaker after the spatial error model
+moran.test(residuals(sem), lw, zero.policy = TRUE)
+```
+
+### Summary of exposure estimates across models
+
+```{r}
+#| label: sensitivity-summary
+#| fig-height: 5
+
+exposure.summary <- bind_rows(sens.ols, keep_exposures(sem.results)) |>
+  mutate(term = case_when(term == "water.statusTCE detected"  ~ "Water: TCE detected",
+                          term == "water.statusNot monitored" ~ "Water: not monitored",
+                          term == "log.npl.dist"              ~ "Superfund: log10 distance",
+                          term == "log.airtox"                ~ "Air: log10 TCE"),
+         model = factor(model, levels = c("Main model", "+ County fixed effects",
+                                          "Without % uninsured", "Spatial error model")))
+
+exposure.summary |>
+  transmute(term, model,
+            estimate = round(estimate, 3),
+            ci = sprintf("(%.3f, %.3f)", conf.low, conf.high),
+            p.value = signif(p.value, 2)) |>
+  arrange(term, model) |>
+  knitr::kable(col.names = c("Exposure", "Model", "Estimate", "95% CI", "p-value"))
+
+exposure.summary |>
+  mutate(model = fct_rev(model)) |>
+  ggplot(aes(x = estimate, y = model, xmin = conf.low, xmax = conf.high, color = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_pointrange() +
+  facet_wrap(~ term, scales = "free_x", ncol = 2) +
+  scale_color_viridis_d(end = 0.8, guide = "none") +
+  labs(x = "Difference in cognitive difficulty, ages 18-64 (percentage points), with 95% CI",
+       y = NULL,
+       title = "Fully adjusted TCE exposure estimates across sensitivity analyses") +
+  theme_minimal()
+```
+
+### Summary of findings
+
+**Who is exposed.** TCE exposure was not evenly distributed. Tracts where TCE was detected at a nearby monitoring site were far more urban than monitored tracts without a detection (median 3,134 versus 78 people per km²), had a much larger share of racial and ethnic minority residents (33% versus 9%), and had more poverty (17.6% versus 14.1% below 150% of the poverty line) and unemployment. They were also closer to TCE Superfund sites and had higher modeled air concentrations, so the three exposure sources partly overlap. Tracts within 5 km of a TCE Superfund site were wealthier than tracts more than 10 km away (median household income \$83,920 versus \$66,471) but more diverse and densely populated, reflecting the concentration of sites in suburban southeast Pennsylvania. Cognitive difficulty was, if anything, lower in exposed tracts: 4.1% in both TCE-detected tracts and tracts within 5 km of a Superfund site, compared with 5.2% in tracts more than 10 km from a site.
+
+**Crude associations were explained by social vulnerability.** In unadjusted models, tracts with a TCE detection had 0.97 percentage points more cognitive difficulty than monitored tracts without a detection. After adjusting for social vulnerability, this reversed to -0.45 percentage points, and to -0.51 after adding population density, with a confidence interval reaching zero. Each 10-fold increase in distance from a TCE Superfund site was associated with 0.96 percentage points more cognitive difficulty in the crude model and 0.45 after full adjustment, meaning tracts closer to sites had less cognitive difficulty, the opposite of the hypothesized direction. Modeled air TCE was not associated with cognitive difficulty in any model. The exposures alone explained less than 1% of the variation in cognitive difficulty, while the fully adjusted models explained about 37%, almost entirely through the social vulnerability measures, especially poverty, education, and income.
+
+**The Superfund association reflects differences between counties.** Adding county fixed effects, which compares tracts only with other tracts in the same county, reduced the Superfund distance estimate from 0.38 to 0.07 percentage points (95% CI -0.35 to 0.49). The association therefore came from comparing counties with many TCE Superfund sites to counties far from any site, which differ in many ways the covariates do not capture. Within counties, distance to a site was not associated with cognitive difficulty. The water detection estimate was stable across all sensitivity analyses at about -0.5 percentage points but never clearly different from zero (p-values 0.05 to 0.10), and the air estimate remained null throughout. Removing percent uninsured, which had an unexpected negative coefficient likely because disability makes people eligible for public insurance, did not change any exposure estimate.
+
+**Spatial dependence.** Cognitive difficulty was strongly spatially clustered (Moran's I = 0.34). The covariates explained much of this clustering, but the main model's residuals remained clustered (Moran's I = 0.09, p \< 0.001). A spatial error model (λ = 0.23) fit better than the ordinary model (AIC 17,626 versus 17,696) and removed the residual clustering (Moran's I = -0.004, p = 0.65). Its exposure estimates were close to those of the main model, and it did not remove the Superfund association, because it accounts for similarity between neighboring tracts rather than broader differences between regions. Only the county fixed effects did.
+
+**Overall.** Across water monitoring, Superfund proximity, and modeled air concentrations, there was no evidence that higher environmental TCE exposure was associated with higher rates of cognitive difficulty among adults aged 18-64 in Pennsylvania census tracts. Crude associations were explained by social vulnerability and regional differences. This is an ecological finding about tracts, not individuals: a broad self-reported outcome, patchy exposure data, and tract-level averaging could all hide an effect on the individuals most heavily exposed.
+
+## Conclusion
+
+This project asked whether environmental exposure to trichloroethylene is associated with cognitive difficulty across Pennsylvania census tracts after accounting for social vulnerability. I built three tract-level exposure measures from public data, each reflecting a different pathway: detections at water monitoring sites from the Water Quality Portal, proximity to Superfund sites with TCE as a contaminant of concern, and modeled air concentrations from EPA's 2020 AirToxScreen. None of the three showed the expected association. Tracts with more TCE exposure did not have higher rates of cognitive difficulty among adults aged 18-64, and the associations that appeared in unadjusted models were explained by social vulnerability and by differences between counties. The apparent link between Superfund proximity and lower cognitive difficulty disappeared once tracts were compared only with others in the same county, and accounting for spatial clustering did not change the conclusions.
+
+The clearest finding concerns who is exposed rather than what exposure does. Tracts where TCE was detected in water were more urban, more racially and ethnically diverse, and had more poverty and unemployment than monitored tracts without a detection. Air exposure was concentrated around a small number of industrial facilities, mostly metal tube manufacturers, where nearly all of the modeled concentration came from stationary point sources. Superfund sites with TCE were concentrated in southeast Pennsylvania. This uneven distribution is itself an environmental justice concern, and it is also why careful adjustment mattered: without it, the analysis would have attributed differences in social and regional context to TCE.
+
+These results should be read as an ecological, cross-sectional analysis with several important limitations:
+
+- **Ecological design.** Associations between tracts do not describe individuals. A real effect on the most heavily exposed residents could be invisible in tract averages, especially when most residents of an "exposed" tract may have little exposure.
+- **A broad outcome.** The ACS measure of cognitive difficulty is reported by one household member and covers many conditions, including developmental disability, mental illness, brain injury, and substance use. Any effect of TCE would be diluted by everything else the measure captures.
+- **Sparse and preferential exposure data.** Water monitoring covered only about one in five tracts, sampling tends to cluster near suspected contamination, and only 62 monitoring sites ever detected TCE. Superfund sites were located by a single coordinate rather than their full footprint and plume, and distance is a crude proxy for vapor intrusion. AirToxScreen is a screening model for a single year, not a measurement.
+- **Timing.** The exposure data span 2000 to 2020 and the outcome 2018 to 2022, but neurological effects may follow exposure by many years, and residents move. Current tract of residence may say little about lifetime exposure.
+- **Residual confounding.** The county fixed effects showed how strongly regional context drives these associations, and unmeasured differences within counties could remain.
+
+Despite these limitations, the analysis has several strengths. It combines three independent exposure sources covering different pathways, measures distance from where people live rather than from tract boundaries, restricts the outcome to working-age adults to reduce confounding by age, and tests its main findings against regional fixed effects, alternative covariate choices, and spatial dependence. The way the crude associations changed under these checks is itself informative about how geography and social vulnerability shape environmental health data.
+
+The most important next step is moving from tracts to individuals. The tract-level exposure file built here can be linked to Penn Medicine BioBank participants by the BioBank's data team, without revealing participant locations, to run a phenome-wide association study across diagnosed conditions. That would allow testing more specific outcomes with stronger prior evidence, such as Parkinson's disease, dementia, and kidney cancer, using clinical diagnoses rather than self-report, and adjusting for individual characteristics. Further work at the tract level could examine specific health measures from CDC PLACES, incorporate residential history where available, and complete the remaining sensitivity analyses on non-detect handling, buffer distance, and ambient air concentrations.
