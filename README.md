@@ -20,8 +20,8 @@ The outcome is the percentage of adults aged 18-64 reporting a cognitive difficu
 
 | File or folder | Description |
 |---|---|
-| `final_project_draft5.qmd` | The full report: data retrieval, cleaning, exposure construction, analysis, and write-up. All code is in this file. |
-| `final_project_draft5.html` | Rendered report |
+| `final_project_draft6.qmd` | The full report: data retrieval, cleaning, exposure construction, analysis, and write-up. All code is in this file. |
+| `final_project_draft6.html` | Rendered report |
 | `final_project.R` | Earlier standalone script for the Superfund and AirToxScreen exposures. Its code is now in the `.qmd`; kept for reference only. |
 | `data/raw/` | Downloaded source data and cached query results (created on first render; see below) |
 | `data/processed/` | Tract-level outputs: exposure measures, the analytic dataset, and the AirToxScreen facility table |
